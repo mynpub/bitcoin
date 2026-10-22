@@ -46,6 +46,8 @@ containing the secret can learn it.
 Only the canonical native P2WSH template is supported. Arbitrary scripts,
 P2SH wrapping, Taproot, and time-based locktimes are not interchangeable with
 this protocol. The witness program is `OP_0 <SHA256(witnessScript)>`.
+Timeouts must be block heights below the BIP65 `LOCKTIME_THRESHOLD`
+(500,000,000), not Unix timestamps.
 
 Both witness scripts use this ASM:
 
@@ -173,6 +175,15 @@ exclusive opportunity to redeem. No script or offer can insure against that.
 Fork-specific signature rules also matter; a transaction signed for one ruleset
 must not be assumed valid under another.
 
+In this checkout, mempool admission applies `CoinbaseMaturityLong` to all
+coinbase creation heights, whereas block validation applies the long rule
+according to the configured activation window and creation height. The
+prototype therefore uses the conservative maximum of ordinary and configured
+long maturity when sizing recovery windows and building relayable spends.
+These values come from the selected network's consensus parameters, not a
+hardcoded mainnet schedule. It can wait longer than current block consensus
+strictly requires.
+
 **Miner equivocation.** The miner can advertise incompatible offers, mine a
 different script, withhold the secret, or disclose it selectively. Bind payment
 to the actual canonical coinbase outpoint, script, value, and height, not an
@@ -188,6 +199,124 @@ hash/outpoint, funding outpoint, transactions, and confirmation targets. Back
 up wallet keys and the secret securely. The prototype is stateless: RPC
 introspection is a current chain/mempool snapshot, not an audit log, escrow
 registry, or assertion that a historical trade completed.
+
+## RPC interface
+
+All six commands are wallet RPCs and take one JSON object named `request`.
+Select a wallet with `bitcoin-cli -rpcwallet=NAME` (or the corresponding
+`/wallet/NAME` HTTP endpoint). Successful results include the experimental
+`warning`; invalid input produces the normal structured JSON-RPC error.
+Unknown and duplicate object members are rejected. Never pass a private key.
+
+### Offer creation and decoding
+
+Call `createcoinbasefinancingoffer` **before** mining, with these fields:
+
+```json
+{
+  "buyer_pubkey": "<66 hex characters, compressed public key>",
+  "miner_pubkey": "<different compressed public key>",
+  "secret_hash": "<64 hex characters, SHA256 of 32-byte secret>",
+  "coinbase_amount": 1.0,
+  "payment_amount": 0.9,
+  "coinbase_height": 500,
+  "payment_timeout": 550,
+  "recovery_timeout": 650
+}
+```
+
+The heights above are illustrative for ordinary-maturity regtest, **not**
+recommendations for other networks or a live chain tip. Amounts are in BTC.
+The result contains `offer`, `coinbase_address`, `payment_address`,
+`coinbase_witness_script`, `payment_witness_script`, and
+`conservative_maturity`. Preserve the returned `offer` exactly: it adds
+`version: 1` and the network's genesis-block hash as `genesis`.
+
+`decodecoinbasefinancingoffer {"offer": OFFER}` validates that object and
+returns the same script/address description. It does not attest to mining,
+counterparty identity, or funding.
+
+The enforced lower-bound invariants are:
+
+* Both legs require at least six confirmations before miner disclosure.
+* The payment timeout is at least `coinbase_height + 6 + 12`.
+* Recovery is at least `coinbase_height + conservative_maturity + 12`.
+* Recovery is at least `payment_timeout + 12`.
+* Claim builders require at least 12 blocks remaining before the relevant
+  timeout; funding reserves additional time for payment confirmations.
+
+These are prototype guardrails, not a guarantee that 12 blocks is sufficient
+under congestion or attack. Decode/build revalidate the selected network's
+current parameters. Choose larger margins for realistic operational risks.
+
+### Buyer funding
+
+After mining and verifying the financed output, call:
+
+```text
+createbuyerfundinghtlc {
+  "offer": OFFER,
+  "coinbase": {"txid": COINBASE_TXID, "vout": OUTPUT_INDEX}
+}
+```
+
+The command verifies the actual confirmed coinbase and returns payment
+`outputs` and an **empty-input** PSBT. It does not select or lock wallet
+coins. Use the returned `outputs` with `walletcreatefundedpsbt`, explicitly
+select a suitable fee rate and RBF, review its outputs and change, then
+`walletprocesspsbt`, `finalizepsbt`, and `sendrawtransaction`. This ordinary
+funding transaction spends normal wallet coins; it does not spend the custom
+HTLC. Record the actual payment output index, not an assumed index, and monitor
+its confirmations. Recheck the offer/outpoints if funding is delayed.
+
+### Claims, refund, and recovery
+
+`claimbuyerfundinghtlc` accepts:
+
+```text
+{
+  "offer": OFFER,
+  "coinbase": {"txid": COINBASE_TXID, "vout": OUTPUT_INDEX},
+  "payment": {"txid": PAYMENT_TXID, "vout": PAYMENT_OUTPUT_INDEX},
+  "destination": ADDRESS,
+  "fee_rate": INTEGER_SAT_PER_VBYTE,
+  "mode": "claim",
+  "secret": SECRET_HEX
+}
+```
+
+Use the miner's wallet for `claim`. Both outputs must still match the offer
+and have the required confirmations. The returned signed transaction reveals
+the secret even before broadcast. To refund, use the buyer's wallet, set
+`mode: "refund"`, and **omit** `secret`; wait until the payment timeout.
+Refund does not require the original coinbase to remain unspent or canonical.
+
+`createbuyerredemptiontx` takes the same fields except that `payment` is not
+required. Use the buyer's wallet with `mode: "claim"` and `secret` to spend the
+conservatively mature coinbase. Learning a secret is not proof that the payment
+claim confirmed; independently monitor it. Use the miner's wallet with
+`mode: "recovery"` and no secret to recover after the recovery timeout and
+maturity. Never disclose a secret merely to request a refund or recovery.
+
+Spend builders return `fee`, a metadata `psbt`, `complete`, and signed `hex`
+when the selected wallet has the required signing key. They never broadcast.
+The custom HTLC is not understood by generic wallet signing/finalization:
+the metadata PSBT is an integration point for a **template-aware** signer,
+not a promise that `walletprocesspsbt` will finalize it. Preserve the secret
+separately and inspect the signed raw transaction. A watch-only or unsupported
+signer cannot be treated as a completed claim.
+
+### Introspection
+
+`getcoinbasefinancingstatus` accepts `offer` and optional `coinbase` and
+`payment` outpoints. It returns a `snapshot_height`, per-leg states and
+confirmation counts, plus maturity and payment-window indicators.
+`unknown` means no outpoint was supplied; `spent_or_missing` deliberately
+does not distinguish a spend, reorg, or nonexistent output. Present but
+mismatching unspent outputs are errors. Height-based maturity/window
+indicators do not prove that either leg exists or that a trade completed.
+
+## Monitoring and relay policy
 
 Use at least the enforced confirmation depth for both coinbase and payment,
 and choose deeper confirmation targets for higher reorg exposure. Recheck
