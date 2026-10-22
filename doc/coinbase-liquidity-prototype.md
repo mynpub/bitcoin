@@ -15,6 +15,8 @@ hashlocked claim and the miner a later recovery path. The buyer pays for that
 claim through a separate HTLC. The miner spends the payment by revealing a
 secret; the buyer uses the same secret to spend the financed coinbase once
 consensus permits it.
+Early liquidity still requires the protocol's confirmation waits; it is not
+instant or zero-confirmation settlement.
 
 **An existing coinbase output cannot be retrofitted.** Create and agree on the
 offer before mining, then direct the actual coinbase output to its returned
@@ -70,16 +72,25 @@ OP_ENDIF
 Witness examples, from bottom to top (script last):
 
 ```text
-claim:    <DER_signature || SIGHASH_ALL> <32-byte secret> <01> <witnessScript>
-timeout:  <DER_signature || SIGHASH_ALL> <>                  <witnessScript>
+claim:    <signature_with_hashtype> <32-byte secret> <01> <witnessScript>
+timeout:  <signature_with_hashtype> <>                  <witnessScript>
 ```
 
 The false selector is an empty vector, not a one-byte zero. The true selector
 is exactly `01`. Signatures commit to the spending transaction and previous
-output amount. Timeout spends use a non-final input sequence and an absolute
+output amount with `SIGHASH_ALL` semantics. This fork's opted-in signature
+format also sets `SIGHASH_UNIFIED`; do not assume signatures produced under
+different fork settings are interchangeable. Timeout spends use a non-final
+input sequence and an absolute
 `nLockTime` at least the timeout. Such a transaction becomes final for a block
 whose height is **greater than** that locktime. Coinbase maturity independently
 applies to *both* coinbase branches.
+
+The buyer obtains the secret from the payment claim's witness, not from the
+offer. Verify that the transaction spends the recorded payment outpoint, uses
+the expected script and claim branch, and contains a 32-byte preimage matching
+the offer's SHA256 digest. Preserve that observation even if the transaction
+is later disconnected. Status RPCs do not extract or store preimages for you.
 
 The claim branch does **not** expire at the timeout. After a timeout both
 branches can be valid, producing a race. A timeout is not a mechanism for
@@ -239,15 +250,27 @@ counterparty identity, or funding.
 The enforced lower-bound invariants are:
 
 * Both legs require at least six confirmations before miner disclosure.
-* The payment timeout is at least `coinbase_height + 6 + 12`.
+* The payment timeout is at least `coinbase_height + 2 * 6 + 12`.
 * Recovery is at least `coinbase_height + conservative_maturity + 12`.
 * Recovery is at least `payment_timeout + 12`.
 * Claim builders require at least 12 blocks remaining before the relevant
   timeout; funding reserves additional time for payment confirmations.
+* The financed output's height must not predate the selected network's CLTV
+  and Segwit activation heights. Consensus activation, not just local policy
+  verification flags, must protect the scripts.
 
 These are prototype guardrails, not a guarantee that 12 blocks is sufficient
 under congestion or attack. Decode/build revalidate the selected network's
 current parameters. Choose larger margins for realistic operational risks.
+Each offered leg must contain at least 20,000 satoshis. Spend builders accept
+integral fee rates from 1 through 1,000 sat/vB, also subject to the local relay
+and mempool minimums. They cap the spending fee at one percent of the input
+and require at least 1,000 satoshis left in the destination output in addition
+to dust checks. Creating, decoding, and funding an offer also requires a
+conservative spending-fee reserve and local dust checks for both legs at the
+current local fee floor; miner disclosure rechecks both legs at the requested
+rate. Decoding does not reserve future fees. The minimum offer size does not
+guarantee that an output can be redeemed economically at a future fee rate.
 
 ### Buyer funding
 
@@ -291,8 +314,8 @@ the secret even before broadcast. To refund, use the buyer's wallet, set
 `mode: "refund"`, and **omit** `secret`; wait until the payment timeout.
 Refund does not require the original coinbase to remain unspent or canonical.
 
-`createbuyerredemptiontx` takes the same fields except that `payment` is not
-required. Use the buyer's wallet with `mode: "claim"` and `secret` to spend the
+`createbuyerredemptiontx` takes the same fields except that `payment` is
+omitted. Use the buyer's wallet with `mode: "claim"` and `secret` to spend the
 conservatively mature coinbase. Learning a secret is not proof that the payment
 claim confirmed; independently monitor it. Use the miner's wallet with
 `mode: "recovery"` and no secret to recover after the recovery timeout and
@@ -305,6 +328,9 @@ the metadata PSBT is an integration point for a **template-aware** signer,
 not a promise that `walletprocesspsbt` will finalize it. Preserve the secret
 separately and inspect the signed raw transaction. A watch-only or unsupported
 signer cannot be treated as a completed claim.
+Recipient addresses must use supported P2PKH, P2SH, P2WPKH, P2WSH, or P2TR
+forms; unknown witness versions and anyone-can-spend anchor addresses are
+not payout destinations for this prototype.
 
 ### Introspection
 
@@ -315,6 +341,8 @@ confirmation counts, plus maturity and payment-window indicators.
 does not distinguish a spend, reorg, or nonexistent output. Present but
 mismatching unspent outputs are errors. Height-based maturity/window
 indicators do not prove that either leg exists or that a trade completed.
+The current implementation scans the mempool to detect pending spends; this
+is linear in mempool size and is not designed for high-volume polling.
 
 ## Monitoring and relay policy
 
@@ -332,10 +360,49 @@ transactions manually; preserve the intended recipient and avoid accidentally
 disclosing a secret during an abort. Do not rely on generic wallet fee-bumping
 or generic PSBT finalization understanding an arbitrary HTLC.
 
+One practical manual bump route is CPFP: send the claim to a fresh standard
+address in the claimant's wallet, then explicitly spend that unconfirmed
+output in a high-fee child. Use the existing wallet PSBT funding/signing flow,
+check whether untrusted-input selection must be explicitly enabled, and
+budget for the **combined parent/child** virtual size and fees. Verify the
+child's actual input and change before broadcasting. This cannot rescue a
+parent rejected by every relay peer, guarantee package acceptance, or remove
+pinning/censorship risk. Do not assume that calling an HTLC builder again will
+replace an existing mempool spend.
+
 Standard native P2WSH relay, active CLTV/Segwit rules, sufficient output value,
 and compatible signature rules are required. Local dust, minimum relay fee,
 mempool fee floor, and maximum fee checks are guardrails, not guarantees about
 other peers' policies or future economic viability.
+
+The prototype honors this fork's existing signing policy: scheduling the
+Blake2b fork selects unified signatures unless `-walletoldsigs` explicitly
+opts out. When unified signing is selected but the next block is still before
+activation, the custom HTLC spend builders fail closed. Offer creation,
+funding templates, decode, and status remain available. This is not a
+recommendation to disable replay protection to bypass the restriction.
+
+## Building and testing
+
+Using the existing CMake, Boost, and Python functional-test infrastructure:
+
+```sh
+SRC=/absolute/path/to/bitcoin
+BUILD=/tmp/bitcoin-coinbase-liquidity-build
+cmake -S "$SRC" -B "$BUILD" -DBUILD_GUI=OFF -DWITH_BDB=OFF -DBUILD_TESTS=ON
+cmake --build "$BUILD" --target bitcoind bitcoin-cli test_bitcoin -j2
+"$BUILD/bin/test_bitcoin" --run_test=coinbase_liquidity_tests,wallet_rpc_tests
+python3 "$SRC/test/functional/wallet_coinbase_liquidity.py" \
+  --configfile="$BUILD/test/config.ini" --descriptors
+python3 "$SRC/test/functional/wallet_coinbase_liquidity.py" \
+  --configfile="$BUILD/test/config.ini" --descriptors --unified
+python3 "$SRC/test/functional/wallet_coinbase_liquidity.py" \
+  --configfile="$BUILD/test/config.ini" --descriptors --unified --legacy-signatures
+```
+
+These tests use disposable regtest funds. Run the existing wallet/RPC and
+fork-specific regression suites as well before distributing a build; targeted
+prototype tests are not a substitute for wider regression testing.
 
 ## Before any production consideration
 

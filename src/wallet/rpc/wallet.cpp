@@ -1125,9 +1125,22 @@ RPCHelpMan abandontransaction();
 RPCHelpMan rescanblockchain();
 RPCHelpMan abortrescan();
 
+RPCHelpMan createcoinbasefinancingoffer();
+RPCHelpMan decodecoinbasefinancingoffer();
+RPCHelpMan createbuyerfundinghtlc();
+RPCHelpMan claimbuyerfundinghtlc();
+RPCHelpMan createbuyerredemptiontx();
+RPCHelpMan getcoinbasefinancingstatus();
+
 Span<const CRPCCommand> GetWalletRPCCommands()
 {
     static const CRPCCommand commands[]{
+        {"wallet", &createcoinbasefinancingoffer},
+        {"wallet", &decodecoinbasefinancingoffer},
+        {"wallet", &createbuyerfundinghtlc},
+        {"wallet", &claimbuyerfundinghtlc},
+        {"wallet", &createbuyerredemptiontx},
+        {"wallet", &getcoinbasefinancingstatus},
         {"rawtransactions", &fundrawtransaction},
         {"wallet", &abandontransaction},
         {"wallet", &abortrescan},
